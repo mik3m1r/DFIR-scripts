@@ -75,13 +75,59 @@ $null  = New-Item -ItemType Directory -Path $root -Force
 "logs","volatile","registry","artifacts" | ForEach-Object { New-Item -ItemType Directory -Path (Join-Path $root $_) -Force | Out-Null }
 $LogPath    = Join-Path $root "collection.log"
 $ErrorsPath = Join-Path $root "errors.log"
-$global:ErrorList = [System.Collections.ArrayList]::new()
+$global:ErrorList = New-Object System.Collections.ArrayList
 
 function Log  { param([string]$msg) $t=(Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"); "[$t] $msg" | Tee-Object -FilePath $LogPath -Append | Out-Host }
 function Warn { param([string]$msg) $t=(Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"); $l="[$t] WARNING: $msg"; $l|Tee-Object -FilePath $LogPath -Append|Out-Host; [void]$global:ErrorList.Add($msg) }
 function Note { param([string]$msg) $t=(Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"); "[$t] NOTE: $msg" | Tee-Object -FilePath $LogPath -Append | Out-Host }
 function StepProgress { param([int]$step,[int]$total,[string]$status="") $pct = if ($total -gt 0){[int](($step/$total)*100)}else{0}; Write-Progress -Id 1 -Activity "Recolección de evidencia" -Status $status -PercentComplete $pct }
 function Quote-Arg { param([string]$Arg) if ($Arg -match '[\s"]') { '"{0}"' -f ($Arg -replace '"','\"') } else { $Arg } }
+
+# Hash compatible con PS 4.0 (usa Get-FileHash si existe o .NET si no)
+function Get-FileHashCompat {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory=$true)]
+    [string]$LiteralPath,
+    [ValidateSet('SHA256','MD5','SHA1')]
+    [string]$Algorithm = 'SHA256'
+  )
+  begin {
+    if ($script:HasGetFileHash -eq $null) {
+      $script:HasGetFileHash = (Get-Command Get-FileHash -ErrorAction SilentlyContinue) -ne $null
+    }
+  }
+  process {
+    if ($script:HasGetFileHash) {
+      return Get-FileHash -LiteralPath $LiteralPath -Algorithm $Algorithm -ErrorAction Stop
+    } else {
+      $algoObj = $null
+      try {
+        switch ($Algorithm) {
+          'SHA256' { $algoObj = [System.Security.Cryptography.SHA256]::Create() }
+          'SHA1'   { $algoObj = [System.Security.Cryptography.SHA1]::Create() }
+          'MD5'    { $algoObj = [System.Security.Cryptography.MD5]::Create() }
+        }
+        $fs = [System.IO.File]::Open($LiteralPath,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::Read)
+        try {
+          $hashBytes = $algoObj.ComputeHash($fs)
+        } finally {
+          if ($fs) { $fs.Dispose() }
+          if ($algoObj) { $algoObj.Dispose() }
+        }
+        $hashString = -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
+        $obj = New-Object PSObject -Property @{
+          Path      = $LiteralPath
+          Algorithm = $Algorithm
+          Hash      = $hashString.ToUpperInvariant()
+        }
+        return $obj
+      } catch {
+        throw
+      }
+    }
+  }
+}
 
 # Ejecuta externo y devuelve resultado (sin registrar WARN automáticamente)
 function Invoke-ExternalRaw {
@@ -302,6 +348,7 @@ try {
   [void](Save-RegistryHive -Hive "HKLM\SYSTEM"   -OutPath (Join-Path $root "registry/SYSTEM.hiv"))
   [void](Save-RegistryHive -Hive "HKLM\SECURITY" -OutPath (Join-Path $root "registry/SECURITY.hiv"))
   [void](Save-RegistryHive -Hive "HKLM\SOFTWARE" -OutPath (Join-Path $root "registry/SOFTWARE.hiv"))
+  [void](Save-RegistryHive -Hive "HKLM\SOFTWARE" -OutPath (Join-Path $root "registry/SOFTWARE.hiv"))
   [void](Save-RegistryHive -Hive "HKU\.DEFAULT"  -OutPath (Join-Path $root "registry/DEFAULT.hiv"))
   $amc = "$env:WINDIR\AppCompat\Programs\Amcache.hve"
   if (Test-Path -LiteralPath $amc) { [void](Copy-FileWithFallback -Source $amc -Dest (Join-Path $root "registry/Amcache.hve")) } else { Log "Amcache no presente. Omitido." }
@@ -360,7 +407,7 @@ if ($DumpMemory) {
       Write-Progress -Id 3 -ParentId 1 -Activity "WinPMEM" -Completed
       if ($proc.ExitCode -ne 0) { Warn "WinPMEM ExitCode=$($proc.ExitCode)" }
       if (Test-Path -LiteralPath $memPath) {
-        try { Get-FileHash -LiteralPath $memPath -Algorithm SHA256 | Format-List * | Out-File (Join-Path $root "memory_SHA256.txt") }
+        try { Get-FileHashCompat -LiteralPath $memPath -Algorithm SHA256 | Format-List * | Out-File (Join-Path $root "memory_SHA256.txt") }
         catch { Warn "Hash memoria: $($_.Exception.Message)" }
       } else { Warn "Archivo de memoria no generado." }
     } catch { Warn "WinPMEM: $($_.Exception.Message)" }
@@ -375,7 +422,7 @@ try {
   $memGB = [math]::Round(($sys.TotalPhysicalMemory/1GB),2)
   $freeGB = $null; if ($BasePath -match '^[A-Za-z]:') { $drv = New-Object System.IO.DriveInfo ($BasePath.Substring(0,1)+':'); $freeGB = [math]::Round(($drv.AvailableFreeSpace/1GB),2) }
   $toolMemLeaf = if ($WinpmemPath) { Split-Path -Leaf $WinpmemPath } else { "" }
-  $toolMemHash = $null; if ($WinpmemPath -and (Test-Path -LiteralPath $WinpmemPath)) { $toolMemHash = (Get-FileHash -LiteralPath $WinpmemPath -Algorithm SHA256).Hash }
+  $toolMemHash = $null; if ($WinpmemPath -and (Test-Path -LiteralPath $WinpmemPath)) { $toolMemHash = (Get-FileHashCompat -LiteralPath $WinpmemPath -Algorithm SHA256).Hash }
   $memDumpLeaf = if ($memPath) { Split-Path -Leaf $memPath } else { "" }
   $manifest = [ordered]@{
     Host=$hostn; TimeUTC=$ts; Operator=$Operator; Base=$root; MemoryDump=$memDumpLeaf;
@@ -408,7 +455,7 @@ try {
   foreach($f in $files){
     if (Should-SkipHash $f.FullName) { continue }
     $i++; Write-Progress -Id 4 -ParentId 1 -Activity "Hashing" -Status $f.FullName -PercentComplete ([int](($i/$cnt)*100))
-    try { $h=Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256 -ErrorAction Stop; '"{0}",{1}' -f $f.FullName,$h.Hash | Out-File $csv -Append -Encoding utf8 }
+    try { $h = Get-FileHashCompat -LiteralPath $f.FullName -Algorithm SHA256; '"{0}",{1}' -f $f.FullName,$h.Hash | Out-File $csv -Append -Encoding utf8 }
     catch { Warn "Hash falló: $($f.FullName) -> $($_.Exception.Message)" }
   }
   Write-Progress -Id 4 -ParentId 1 -Activity "Hashing" -Completed
@@ -422,7 +469,7 @@ try {
   try { New-Zip -SourceRoot $root -ZipPath $zipPath }
   catch { Warn "ZIP general: $($_.Exception.Message)" }
   Write-Progress -Id 5 -ParentId 1 -Activity "Compresión ZIP" -Completed
-  try { Get-FileHash -LiteralPath $zipPath -Algorithm SHA256 | Format-List * | Out-File ($zipPath + ".sha256.txt") } catch { Warn "Hash ZIP: $($_.Exception.Message)" }
+  try { Get-FileHashCompat -LiteralPath $zipPath -Algorithm SHA256 | Format-List * | Out-File ($zipPath + ".sha256.txt") } catch { Warn "Hash ZIP: $($_.Exception.Message)" }
 } catch { Warn "ZIP general: $($_.Exception.Message)" }
 
 # 14) ACL final (opcional)
