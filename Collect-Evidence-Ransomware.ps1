@@ -1,9 +1,9 @@
 ﻿<#
-  Collect-Evidence-Ransomware.ps1  (v2.0.2)
+  Collect-Evidence-Ransomware.ps1  (v2.0.3)
 
-  Cambios vs 2.0.1:
-    - Mensaje de error de esentutl mejorado para explicar ExitCode -1032
-      (archivo en uso/bloqueado) y que se intentará copia vía VSS.
+  Cambios vs 2.0.2:
+    - Ajuste de la invocación a WinPMEM para la versión winpmem_mini_x64_rc2.exe
+      (sintaxis: winpmem.exe [opciones] <output_path>, sin --output/--format).
 
   Propósito:
     Script de triage para incidentes de ransomware en Windows.
@@ -21,8 +21,8 @@
         powershell -ExecutionPolicy Bypass -File .\Collect-Evidence-Ransomware.ps1 -Help
     - Recolección básica:
         powershell -ExecutionPolicy Bypass -File .\Collect-Evidence-Ransomware.ps1 -BasePath E:\evidence -Operator SOC
-    - Con volcado de RAM:
-        powershell -ExecutionPolicy Bypass -File .\Collect-Evidence-Ransomware.ps1 -BasePath E:\evidence -Operator SOC -DumpMemory -WinpmemPath E:\tools\winpmem_mini_x64.exe
+    - Con volcado de RAM (ej. winpmem_mini_x64_rc2.exe):
+        powershell -ExecutionPolicy Bypass -File .\Collect-Evidence-Ransomware.ps1 -BasePath E:\evidence -Operator SOC -DumpMemory -WinpmemPath "E:\tools\winpmem_mini_x64_rc2.exe"
     - Preservando SACL/OWNER y endureciendo ACL final:
         powershell -ExecutionPolicy Bypass -File .\Collect-Evidence-Ransomware.ps1 -BasePath \\srv\dfir -PreserveSecurity -FinalizeACL
 #>
@@ -58,7 +58,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'Continue'
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-$ScriptVersion = '2.0.2'
+$ScriptVersion = '2.0.3'
 
 function Show-Help {
 @"
@@ -81,6 +81,8 @@ Parámetros (Run):
   -Operator <texto>    Operador/analista (metadatos).
   -DumpMemory          Volcado de RAM con WinPMEM.
   -WinpmemPath <ruta>  Ruta de winpmem (requerido si usa -DumpMemory).
+                       Para winpmem_mini_x64_rc2.exe la sintaxis es:
+                       winpmem_mini_x64_rc2.exe <ruta_salida.raw>
   -PreserveSecurity    Copia con /COPY:DATSOU (incluye SACL/OWNER). Por defecto /COPY:DAT.
   -FinalizeACL         Endurece permisos finales (solo lectura para Administradores).
 
@@ -89,7 +91,7 @@ Parámetros (Help):
 
 Ejemplos:
   powershell -File .\Collect-Evidence-Ransomware.ps1 -BasePath E:\evidence -Operator "SOC"
-  powershell -File .\Collect-Evidence-Ransomware.ps1 -BasePath \\srv\dfir -DumpMemory -WinpmemPath "E:\tools\winpmem_mini_x64.exe"
+  powershell -File .\Collect-Evidence-Ransomware.ps1 -BasePath \\srv\dfir -DumpMemory -WinpmemPath "E:\tools\winpmem_mini_x64_rc2.exe"
   powershell -File .\Collect-Evidence-Ransomware.ps1 -BasePath D:\evidence -PreserveSecurity -FinalizeACL
 "@ | Out-Host
 }
@@ -314,7 +316,6 @@ function Copy-FileWithFallback {
             Log "esentutl OK: $Source"
             return $true
         } else {
-            # Mensaje más claro según ExitCode
             if ($res.ExitCode -eq -1032) {
                 Note "esentutl no pudo copiar el archivo porque está en uso o bloqueado (ExitCode=-1032, JET_errFileAccessDenied). Se intentará copia usando VSS."
             } else {
@@ -680,8 +681,13 @@ if ($DumpMemory) {
                 }
             }
 
-            $memPath = Join-Path $root "$hostn-$ts.raw"
-            $proc = Start-Process -FilePath $WinpmemPath -ArgumentList @('--output',$memPath,'--format','raw') -NoNewWindow -PassThru
+            # Para winpmem_mini_x64_rc2.exe la sintaxis es:
+            #   winpmem_mini_x64_rc2.exe <ruta_salida.raw>
+            # (en sistemas AMD64 la opción -2 es el valor por defecto).
+            $memPath   = Join-Path $root "$hostn-$ts.raw"
+            $arguments = @($memPath)
+
+            $proc = Start-Process -FilePath $WinpmemPath -ArgumentList $arguments -NoNewWindow -PassThru
 
             while (-not $proc.HasExited) {
                 $size = if (Test-Path -LiteralPath $memPath) { (Get-Item -LiteralPath $memPath).Length } else { 0 }
