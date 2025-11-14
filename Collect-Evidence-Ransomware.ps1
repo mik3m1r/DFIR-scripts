@@ -1,10 +1,14 @@
 ﻿<#
-  Collect-Evidence-Ransomware.ps1  (v2.0.0)
+  Collect-Evidence-Ransomware.ps1  (v2.0.2)
+
+  Cambios vs 2.0.1:
+    - Mensaje de error de esentutl mejorado para explicar ExitCode -1032
+      (archivo en uso/bloqueado) y que se intentará copia vía VSS.
 
   Propósito:
     Script de triage para incidentes de ransomware en Windows.
     Recolecta artefactos forenses habituales (contexto, evidencia volátil,
-    logs de eventos, artefactos de ejecución, hives de registro, WMI y RAM opcional).
+    logs de eventos, registro, WMI, tareas programadas, RAM opcional).
     No realiza hashing ni pretende cubrir una cadena de custodia formal.
 
   Requisitos:
@@ -54,7 +58,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'Continue'
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-$ScriptVersion = '2.0.0'
+$ScriptVersion = '2.0.2'
 
 function Show-Help {
 @"
@@ -63,11 +67,11 @@ Collect-Evidence-Ransomware.ps1 (v$ScriptVersion)
 Descripción:
   Recolecta evidencia típica en un incidente de ransomware:
     - Contexto del sistema.
-    - Información volátil (procesos, red, tareas programadas, drivers).
-    - Logs de eventos (.evtx) críticos para ransomware.
-    - Artefactos comunes: winevt completo, Prefetch, Firewall, IIS, Tasks, carpetas Startup.
+    - Información volátil (procesos, red, sesiones, tareas, drivers).
+    - Logs de eventos críticos para ransomware.
+    - Artefactos comunes: winevt, Prefetch, Firewall/IIS, Tasks, Startup.
     - Hives de registro (HKLM y usuarios) y suscripciones WMI.
-    - Volcado de RAM opcional con WinPMEM.
+    - Volcado de memoria RAM (opcional, con WinPMEM).
     - Compresión final a ZIP.
 
   No realiza hashing ni implementa cadena de custodia formal.
@@ -310,7 +314,12 @@ function Copy-FileWithFallback {
             Log "esentutl OK: $Source"
             return $true
         } else {
-            Note "esentutl copy falló. ExitCode=$($res.ExitCode)."
+            # Mensaje más claro según ExitCode
+            if ($res.ExitCode -eq -1032) {
+                Note "esentutl no pudo copiar el archivo porque está en uso o bloqueado (ExitCode=-1032, JET_errFileAccessDenied). Se intentará copia usando VSS."
+            } else {
+                Note "esentutl no pudo copiar el archivo. ExitCode=$($res.ExitCode). Se intentará copia usando VSS si es posible."
+            }
         }
     }
 
@@ -641,8 +650,8 @@ try {
     $wmip = Join-Path $root 'artifacts\WMI'
     New-Item -ItemType Directory -Path $wmip -Force | Out-Null
 
-    Get-CimInstance -Namespace root\subscription -ClassName __EventFilter           | Out-String -Width 4096 | Out-File (Join-Path $wmip 'EventFilter.txt')
-    Get-CimInstance -Namespace root\subscription -ClassName __EventConsumer         | Out-String -Width 4096 | Out-File (Join-Path $wmip 'EventConsumer.txt')
+    Get-CimInstance -Namespace root\subscription -ClassName __EventFilter             | Out-String -Width 4096 | Out-File (Join-Path $wmip 'EventFilter.txt')
+    Get-CimInstance -Namespace root\subscription -ClassName __EventConsumer           | Out-String -Width 4096 | Out-File (Join-Path $wmip 'EventConsumer.txt')
     Get-CimInstance -Namespace root\subscription -ClassName __FilterToConsumerBinding | Out-String -Width 4096 | Out-File (Join-Path $wmip 'FilterToConsumerBinding.txt')
 } catch {
     Warn "WMI: $($_.Exception.Message)"
@@ -654,7 +663,10 @@ if ($DumpMemory) {
     $Step++; StepProgress $Step $TotalSteps 'Memoria'
     Log 'Volcado de RAM con WinPMEM'
 
-    if (-not (Test-Path -LiteralPath $WinpmemPath)) {
+    # Validar WinpmemPath no vacío antes de Test-Path
+    if (-not $WinpmemPath -or $WinpmemPath.Trim().Length -eq 0) {
+        Warn "Se especificó -DumpMemory pero -WinpmemPath está vacío. RAM omitida."
+    } elseif (-not (Test-Path -LiteralPath $WinpmemPath)) {
         Warn "WinPMEM no encontrado en $WinpmemPath. RAM omitida."
     } else {
         try {
@@ -697,7 +709,7 @@ try {
     $os  = Get-CimInstance Win32_OperatingSystem
     $sys = Get-CimInstance Win32_ComputerSystem
 
-    $memGB = [math]::Round(($sys.TotalPhysicalMemory / 1GB),2)
+    $memGB  = [math]::Round(($sys.TotalPhysicalMemory / 1GB),2)
     $freeGB = $null
 
     if ($BasePath -match '^[A-Za-z]:') {
@@ -707,6 +719,17 @@ try {
 
     $toolMemLeaf = if ($WinpmemPath) { Split-Path -Leaf $WinpmemPath } else { '' }
     $memDumpLeaf = if ($memPath)     { Split-Path -Leaf $memPath }     else { '' }
+
+    # Evitar Test-Path con cadena vacía
+    $winpmemPresent = $false
+    if ($WinpmemPath -and $WinpmemPath.Trim().Length -gt 0) {
+        try {
+            $winpmemPresent = Test-Path -LiteralPath $WinpmemPath
+        } catch {
+            $winpmemPresent = $false
+            Note "Manifest: Test-Path WinpmemPath falló: $($_.Exception.Message)"
+        }
+    }
 
     $manifest = [ordered]@{
         Host       = $hostn
@@ -725,7 +748,7 @@ try {
             MemoryPath     = $toolMemLeaf
             Script         = 'Collect-Evidence-Ransomware.ps1'
             ScriptVersion  = $ScriptVersion
-            WinpmemPresent = (Test-Path -LiteralPath $WinpmemPath)
+            WinpmemPresent = $winpmemPresent
         }
         Notes      = 'Script de triage para incidente de ransomware. No realiza hashing ni asegura cadena de custodia formal.'
     }
