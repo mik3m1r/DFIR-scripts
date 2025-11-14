@@ -85,48 +85,66 @@ function Quote-Arg { param([string]$Arg) if ($Arg -match '[\s"]') { '"{0}"' -f (
 
 # Hash compatible con PS 4.0 (usa Get-FileHash si existe o .NET si no)
 function Get-FileHashCompat {
-  [CmdletBinding()]
-  param(
-    [Parameter(Mandatory=$true)]
-    [string]$LiteralPath,
-    [ValidateSet('SHA256','MD5','SHA1')]
-    [string]$Algorithm = 'SHA256'
-  )
-  begin {
-    if ($script:HasGetFileHash -eq $null) {
-      $script:HasGetFileHash = (Get-Command Get-FileHash -ErrorAction SilentlyContinue) -ne $null
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LiteralPath,
+
+        [ValidateSet('SHA256','MD5','SHA1')]
+        [string]$Algorithm = 'SHA256'
+    )
+
+    begin {
+        # En StrictMode, hay que crear la variable de script antes de leerla
+        $var = Get-Variable -Name HasGetFileHash -Scope Script -ErrorAction SilentlyContinue
+        if (-not $var) {
+            $script:HasGetFileHash = (Get-Command Get-FileHash -ErrorAction SilentlyContinue) -ne $null
+        }
     }
-  }
-  process {
-    if ($script:HasGetFileHash) {
-      return Get-FileHash -LiteralPath $LiteralPath -Algorithm $Algorithm -ErrorAction Stop
-    } else {
-      $algoObj = $null
-      try {
-        switch ($Algorithm) {
-          'SHA256' { $algoObj = [System.Security.Cryptography.SHA256]::Create() }
-          'SHA1'   { $algoObj = [System.Security.Cryptography.SHA1]::Create() }
-          'MD5'    { $algoObj = [System.Security.Cryptography.MD5]::Create() }
+
+    process {
+        if ($script:HasGetFileHash) {
+            # PS 4+ con Get-FileHash disponible
+            return Get-FileHash -LiteralPath $LiteralPath -Algorithm $Algorithm -ErrorAction Stop
         }
-        $fs = [System.IO.File]::Open($LiteralPath,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::Read)
-        try {
-          $hashBytes = $algoObj.ComputeHash($fs)
-        } finally {
-          if ($fs) { $fs.Dispose() }
-          if ($algoObj) { $algoObj.Dispose() }
+        else {
+            # Fallback .NET puro
+            $algoObj = $null
+            try {
+                switch ($Algorithm) {
+                    'SHA256' { $algoObj = [System.Security.Cryptography.SHA256]::Create() }
+                    'SHA1'   { $algoObj = [System.Security.Cryptography.SHA1]::Create() }
+                    'MD5'    { $algoObj = [System.Security.Cryptography.MD5]::Create() }
+                }
+
+                $fs = [System.IO.File]::Open(
+                    $LiteralPath,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read,
+                    [System.IO.FileShare]::Read
+                )
+
+                try {
+                    $hashBytes = $algoObj.ComputeHash($fs)
+                }
+                finally {
+                    if ($fs)     { $fs.Dispose() }
+                    if ($algoObj){ $algoObj.Dispose() }
+                }
+
+                $hashString = -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
+                $obj = New-Object PSObject -Property @{
+                    Path      = $LiteralPath
+                    Algorithm = $Algorithm
+                    Hash      = $hashString.ToUpperInvariant()
+                }
+                return $obj
+            }
+            catch {
+                throw
+            }
         }
-        $hashString = -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
-        $obj = New-Object PSObject -Property @{
-          Path      = $LiteralPath
-          Algorithm = $Algorithm
-          Hash      = $hashString.ToUpperInvariant()
-        }
-        return $obj
-      } catch {
-        throw
-      }
     }
-  }
 }
 
 # Ejecuta externo y devuelve resultado (sin registrar WARN automáticamente)
