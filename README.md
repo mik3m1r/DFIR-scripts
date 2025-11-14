@@ -1,247 +1,464 @@
-# DFIR-scripts
-# Collect-Evidence-DFIR-Improved — README
+# Collect-Evidence-Ransomware.ps1
 
-> Versión del script: **v1.3.5**
-> Recolector de evidencia para Windows con buenas prácticas DFIR: exporta eventos, artefactos de persistencia, hives de registro (HKLM/usuario), WMI, hashes, manifiesto y ZIP final; volcado de RAM opcional con WinPMEM; coping robusto (VSS) y trazabilidad.
+Script de **triage forense** orientado a incidentes de **ransomware** en sistemas Windows.
+
+Recolecta los artefactos mínimos pero relevantes para análisis post-incidente (procesos, red, eventos, registro, WMI, tareas programadas, etc.) y opcionalmente un **volcado de memoria RAM**.
+
+> Nota: el script **no realiza hashing** ni pretende cumplir con una cadena de custodia estricta. Está pensado para respuesta rápida y análisis interno.
 
 ---
 
-## TL;DR (uso rápido)
+## 1. Alcance y limitaciones
+
+### Qué hace
+
+* Recolecta:
+
+  * Contexto del sistema.
+  * Evidencia volátil (procesos, red, sesiones, tareas, drivers).
+  * Logs de eventos críticos para ransomware.
+  * Artefactos comunes (Prefetch, logs Firewall/IIS, Tasks, Startup).
+  * Hives de registro de sistema y usuarios + WMI.
+  * Volcado de memoria RAM (opcional, con WinPMEM).
+* Empaqueta todo en un **ZIP** y genera un `manifest.json` con metadatos.
+
+### Qué no hace
+
+* No genera hashes (ni de ficheros ni del ZIP).
+* No implementa cadena de custodia formal (sellado criptográfico, firmas, etc.).
+* No elimina ni modifica artefactos del sistema (salvo la creación de snapshots VSS temporales).
+
+Úsalo como herramienta de recolección rápida cuando necesitas material para investigación, revisión interna o entrenamiento.
+
+---
+
+## 2. Requisitos
+
+* **Windows**:
+
+  * Windows Server 2012 o superior / Windows 8 o superior.
+* **PowerShell**:
+
+  * PowerShell **4.0 o superior**.
+* **Permisos**:
+
+  * Debe ejecutarse en una consola **elevada** (Run as administrator).
+* **Espacio en disco**:
+
+  * Suficiente espacio en `BasePath` para:
+
+    * Logs y artefactos.
+    * Volcado de RAM (si se usa `-DumpMemory`, el tamaño ≈ RAM física).
+* **WinPMEM (solo si usas `-DumpMemory`)**:
+
+  * Binario de WinPMEM (por ejemplo, `winpmem_mini_x64.exe`).
+
+---
+
+## 3. Uso rápido
+
+### Mostrar ayuda
 
 ```powershell
-# Mostrar ayuda
-powershell -ExecutionPolicy Bypass -File .\Collect-Evidence-DFIR-Improved.ps1 -Help
-
-# Recolección básica
-powershell -EP Bypass -File .\Collect-Evidence-DFIR-Improved.ps1 -BasePath E:\evidence -Operator "SOC"
-
-# Con volcado de memoria (WinPMEM)
-powershell -EP Bypass -File .\Collect-Evidence-DFIR-Improved.ps1 -BasePath E:\evidence -DumpMemory -WinpmemPath E:\tools\winpmem_mini_x64.exe
-
-# Copia preservando SACL/OWNER (cadena de custodia)
-powershell -EP Bypass -File .\Collect-Evidence-DFIR-Improved.ps1 -BasePath \\srv\dfir -PreserveSecurity
-
-# Endurecer permisos al final (solo lectura para Administradores)
-powershell -EP Bypass -File .\Collect-Evidence-DFIR-Improved.ps1 -BasePath D:\evidence -FinalizeACL
-
-# Excluir rutas del hashing (comodines relativos al caso)
-powershell -EP Bypass -File .\Collect-Evidence-DFIR-Improved.ps1 -BasePath E:\evidence -HashExclude 'artifacts\Tasks\Microsoft\Windows\UNP\*'
+powershell -ExecutionPolicy Bypass -File .\Collect-Evidence-Ransomware.ps1 -Help
 ```
 
-> **Requisitos**: ejecutar como **Administrador**. Salidas y artefactos se escriben bajo `-BasePath`.
-
----
-
-## Parámetros
-
-| Parámetro           | Tipo     | Obligatorio | Descripción                                                                                  |
-| ------------------- | -------- | ----------- | -------------------------------------------------------------------------------------------- |
-| `-BasePath`         | string   | Sí          | Carpeta raíz de salida (p. ej. `D:\evidence` o `\\servidor\share`).                          |
-| `-Operator`         | string   | No          | Nombre del operador (metadato en `manifest.json`).                                           |
-| `-DumpMemory`       | switch   | No          | Habilita volcado de RAM con WinPMEM. Requiere `-WinpmemPath`.                                |
-| `-WinpmemPath`      | string   | No          | Ruta al ejecutable de WinPMEM.                                                               |
-| `-PreserveSecurity` | switch   | No          | Robocopy con `/COPY:DATSOU` y `/DCOPY:T` (incluye DACL/SACL/Owner). Por defecto `/COPY:DAT`. |
-| `-HashExclude`      | string[] | No          | Patrones de rutas a **excluir** del hashing (relativos a la carpeta del caso).               |
-| `-FinalizeACL`      | switch   | No          | ACL final opcional: solo lectura para grupo Administradores (independiente de idioma).       |
-| `-Help` / `-?`      | switch   | —           | Muestra ayuda integrada y termina.                                                           |
-
-**Códigos de salida**: `0` sin errores; `2` con errores resumidos en `errors.log`; `1` si no se ejecutó como Admin.
-
----
-
-## Estructura de salida
-
-```
-<BasePath>\<HOST>-<UTC>\
-├─ collection.log            # Bitácora de alto nivel
-├─ errors.log                # Resumen de errores reales (si los hay)
-├─ transcript.log            # Transcripción PowerShell (cerrada antes del hashing)
-├─ manifest.json             # Metadatos del caso (host, OS, RAM, free space, hashes de herramientas)
-├─ hashes_sha256.csv         # Hash de cada archivo recolectado
-├─ volatile\                 # Estado volátil del sistema
-│  ├─ tasklist.txt           # tasklist /v
-│  ├─ processes.txt          # Get-Process completo
-│  ├─ whoami_all.txt         # whoami /all
-│  ├─ netstat.txt, arp.txt, ipconfig.txt, route.txt
-│  ├─ schtasks.txt, drivers.txt
-│  └─ hotfix.txt, os.txt, system.txt, timestamp_utc.txt
-├─ logs\
-│  ├─ Security.evtx, System.evtx, Application.evtx, ...
-│  ├─ Microsoft-Windows-*.evtx
-│  └─ winevt\*.evtx          # Copia íntegra de \Windows\System32\winevt\Logs
-├─ logs\Firewall\*           # Si existe
-├─ logs\IIS\W3SVC*\*.log     # Si existe
-├─ artifacts\
-│  ├─ Prefetch\*             # Prefetch (si habilitado)
-│  ├─ Tasks\...               # Copia de \Windows\System32\Tasks (XML)
-│  ├─ Startup_Global\*       # Inicio global
-│  ├─ Startup_<user>\*       # Inicio por usuario
-│  └─ WMI\EventFilter.txt, EventConsumer.txt, FilterToConsumerBinding.txt
-└─ registry\
-   ├─ SAM.hiv, SYSTEM.hiv, SECURITY.hiv, SOFTWARE.hiv, DEFAULT.hiv
-   ├─ Amcache.hve            # Copiado con VSS si estaba en uso
-   └─ Users\<user>\NTUSER.DAT, UsrClass.dat
-
-# ZIP final
-<BasePath>\<HOST>-<UTC>.zip          # ZIP del caso
-<BasePath>\<HOST>-<UTC>.zip.sha256.txt
-```
-
----
-
-## ¿Qué se recolecta y por qué?
-
-### 1) Registro de ejecución y metadatos
-
-* **`collection.log`**: línea de tiempo de la recolección (útil para cadena de custodia y explicación de omisiones).
-* **`errors.log`**: solo errores **reales** que requieren atención.
-* **`transcript.log`**: comandos PowerShell (se cierra antes del hashing para no bloquear el archivo).
-* **`manifest.json`**: contexto del host (OS/Build, RAM, espacio libre), operador, ruta y hashes de herramientas.
-* **`hashes_sha256.csv`** y **`<ZIP>.sha256.txt`**: integridad de evidencias y del contenedor final.
-
-### 2) Volátil (estado actual)
-
-* **Procesos** (`processes.txt` y `tasklist.txt`), **Red** (`netstat/arp/ipconfig/route`), **Servicios**, **Tareas (vista)**, **Drivers** y **Token actual** (`whoami_all`).
-* **Uso**: detectar ejecuciones inusuales, conexiones salientes, puertos a la escucha, drivers no firmados, tareas anómalas.
-
-### 3) Registros de eventos (.evtx)
-
-* Exportados selectivamente y copia íntegra de `winevt`. Canales clave:
-
-  * `Security`, `System`, `Application`
-  * `Microsoft-Windows-PowerShell/Operational` (4103/4104)
-  * `Microsoft-Windows-TaskScheduler/Operational`
-  * `Microsoft-Windows-Windows Defender/Operational`
-  * `Microsoft-Windows-WMI-Activity/Operational`
-  * `Microsoft-Windows-Bits-Client/Operational`
-  * `Microsoft-Windows-AppLocker/EXE and DLL` (si está habilitado)
-  * `Microsoft-Windows-Sysmon/Operational` (si el host lo tiene)
-
-### 4) Artefactos de ejecución/persistencia
-
-* **Prefetch** (`artifacts\Prefetch\`) → evidencia de ejecución.
-* **Tareas programadas** (`artifacts\Tasks\...`) → persistencia y orquestación.
-* **StartUp** global/usuario (`artifacts\Startup_*`) → persistencia al logon.
-* **WMI** (`artifacts\WMI\*.txt`) → suscripciones de persistencia (Filter/Consumer/Binding).
-
-### 5) Registro (hives)
-
-* **HKLM** (`SYSTEM/SECURITY/SAM/SOFTWARE/DEFAULT`) con `reg save`.
-* **Usuario** (`NTUSER.DAT` y `UsrClass.dat`), con `reg save`, `esentutl` o **VSS** si estaban en uso.
-* **Amcache.hve** (instalación/ejecuciones) con **VSS** si estaba bloqueado.
-
-### 6) Memoria (opcional)
-
-* **`<HOST>-<UTC>.raw`** (WinPMEM) + `memory_SHA256.txt`.
-* Análisis con **Volatility 3** (procesos, inyección, red, strings, Yara, servicios, drivers).
-
----
-
-## ¿Cómo analizarlo luego?
-
-### Eventos (.evtx)
-
-Herramientas recomendadas:
-
-* **Hayabusa**: detecciones rápidas Sigma.
-* **Chainsaw**: hunting con reglas Sigma y mapping de campos.
-* **Eric Zimmerman EvtxECmd**: parseo por canal/plantillas.
-
-Ejemplos:
+### Ejecución básica
 
 ```powershell
-# Hayabusa (CSV)
-hayabusa.exe -e .\logs -o .\out\hayabusa_report.csv
-
-# Chainsaw (detecciones)
-chainsaw hunt .\logs --rules .\sigma\ --mapping .\mappings\windows-event-logs.yml -o .\out\
-
-# EvtxECmd (PowerShell Operational)
-EvtxECmd.exe -f .\logs\Microsoft-Windows-PowerShell_Operational.evtx --csv .\out\
+powershell -ExecutionPolicy Bypass `
+  -File .\Collect-Evidence-Ransomware.ps1 `
+  -BasePath E:\evidence `
+  -Operator "SOC"
 ```
 
-Pistas comunes:
-
-* **Security**: 4624/4625 (logons), 4672 (privilegios), 4697 (servicio), 4720 (usuario).
-* **PowerShell Operational**: 4104 (scriptblock), 4103 (módulos). Buscar `FromBase64String`, `-enc`, `-nop`.
-* **WMI-Activity**: 5857–5861 (Filter/Consumer/Binding).
-* **TaskScheduler Operational**: 106/140 (creación/ejecución).
-* **BITS**: 59/63 (descargas).
-* **Defender**: 1116 (detecciones).
-
-### Prefetch / Amcache
+### Con volcado de memoria
 
 ```powershell
-# Prefetch\ nPECmd.exe -d .\artifacts\Prefetch -o .\out\prefetch.csv
-
-# Amcache
-AmcacheParser.exe -f .\registry\Amcache.hve --csv .\out\amcache.csv
+powershell -ExecutionPolicy Bypass `
+  -File .\Collect-Evidence-Ransomware.ps1 `
+  -BasePath E:\evidence `
+  -Operator "SOC" `
+  -DumpMemory `
+  -WinpmemPath "E:\tools\winpmem_mini_x64.exe"
 ```
 
-Cruzar ejecutables/timestamps con **Security 4688** o **Sysmon 1** (si existe), y con `artifacts\Tasks`.
-
-### Tareas / Startup / WMI
-
-* Abrir XMLs en `artifacts\Tasks` y revisar `Actions/Exec/Command` y `WorkingDirectory`.
-* Buscar en Startup ejecutables o accesos directos no esperados.
-* En WMI, revisar:
-
-  * `__EventFilter` → `Query` (triggers sospechosos)
-  * `__EventConsumer` → `CommandLineTemplate`/`ScriptText`
-  * `__FilterToConsumerBinding` → uniones entre ambos
-
-### Registro (hives)
-
-Herramientas: **Registry Explorer / RECmd**, **ShellBagsExplorer**, parsers específicos.
-
-Claves útiles:
-
-* `HKLM/HKCU\Software\Microsoft\Windows\CurrentVersion\Run(Once)`
-* `HKLM\SYSTEM\CurrentControlSet\Services\*` (persistencia por servicio)
-* `HKCU\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell`
-* `HKCU\Software\Classes\CLSID\{...}\InprocServer32` (COM hijacking)
-* **ShellBags** en `UsrClass.dat` (carpetas visitadas)
-
-### Memoria (si se volcó)
+### Preservando SACL/OWNER y endureciendo ACL final
 
 ```powershell
-# Ejemplos Volatility 3
-vol.py -f <dump.raw> windows.pslist
-vol.py -f <dump.raw> windows.netstat
-vol.py -f <dump.raw> windows.malfind --dump
-vol.py -f <dump.raw> windows.cmdline
-vol.py -f <dump.raw> windows.services
-vol.py -f <dump.raw> windows.vadyarascan --yara-rules rules.yar
+powershell -ExecutionPolicy Bypass `
+  -File .\Collect-Evidence-Ransomware.ps1 `
+  -BasePath \\srv-dfir\recolecciones `
+  -Operator "SOC" `
+  -PreserveSecurity `
+  -FinalizeACL
 ```
 
-### Integridad
+Parámetros principales:
 
-* Recalcular `Get-FileHash -Algorithm SHA256` sobre archivos críticos y comparar con `hashes_sha256.csv`.
-* Validar `<HOST>-<UTC>.zip.sha256.txt` tras transferencias.
-
----
-
-## Notas y solución de problemas
-
-* **Canal ausente (p. ej., Sysmon)** → aparece como `NOTE`, la ejecución continúa.
-* **`esentutl` ExitCode `-1032` (archivo en uso)** → el script intenta **VSS** y registra `Copiado desde VSS:`; solo será **ERROR** si también VSS falla.
-* **ZIP** → usa .NET `ZipArchive` si está disponible; si no, `Compress-Archive` y, como último recurso, `tar.exe -a`.
-* **Locks durante hashing** → el script hace `Stop-Transcript` antes de hashear para evitar bloqueos de `transcript.log`.
-* **ACL final** → solo si se pasa `-FinalizeACL`. Sin este parámetro, no se modifican las ACL del caso/ZIP.
+* `-BasePath` (obligatorio): Ruta donde se creará la carpeta de evidencia y el ZIP.
+* `-Operator`: Nombre o identificador del analista.
+* `-DumpMemory`: Activa el volcado de RAM.
+* `-WinpmemPath`: Ruta del ejecutable de WinPMEM (requerido si `-DumpMemory`).
+* `-PreserveSecurity`: Copia con `/COPY:DATSOU` (incluye SACL y owner).
+* `-FinalizeACL`: Ajusta permisos finales de la carpeta y el ZIP a solo lectura para Administradores.
 
 ---
 
-## Buenas prácticas DFIR
+## 4. Estructura de salida
 
-* Ejecutar desde medio **limpio** y guardar en destino **WORM**/solo lectura.
-* Registrar **quién/cuándo/dónde** (usando `-Operator` y conservando `collection.log`).
-* No montar evidencias en sistemas no controlados; verificar integridad con hashes.
-* Documentar cualquier excepción en `errors.log`.
+Para un host `SRV-FILES` ejecutado en `2025-11-12T21:33:58Z`, se crea:
+
+```text
+<BasePath>\SRV-FILES-20251112T213358Z\
+  collection.log
+  errors.log             (si hubo errores)
+  manifest.json
+  transcript.log
+  logs\
+  volatile\
+  registry\  
+  artifacts\
+  ...
+<BasePath>\SRV-FILES-20251112T213358Z.zip
+```
+
+### Archivos destacados
+
+* `collection.log`
+  Trazas de lo que hizo el script (útil para triage de errores).
+
+* `errors.log`
+  Lista los mensajes de error/advertencia si se produjeron.
+
+* `manifest.json`
+  Metadatos de la ejecución: host, hora, RAM, espacio libre, ruta del volcado de memoria, versión del script, etc.
+
+* `transcript.log`
+  Transcript de la sesión de PowerShell.
 
 ---
 
-## Licencia / Créditos
+## 5. Artefactos recolectados y cómo analizarlos
 
-Michal Emir Reynosa
+### 5.1. Carpeta `volatile\`
+
+Ficheros principales:
+
+* `timestamp_utc.txt`
+  Marca de tiempo en UTC de la recolección. Útil para alinear con otras evidencias.
+
+* `os.txt`, `system.txt`, `hotfix.txt`, `timezone.txt`
+  Información de sistema, hardware, parches y zona horaria.
+  Uso:
+
+  * Verificar versión de Windows y nivel de parches.
+  * Identificar desfases de hora que afectan la línea de tiempo.
+
+* `tasklist.txt`, `processes.txt`, `services.txt`
+  Estado de procesos y servicios en el momento de la recolección.
+  Búscalo para:
+
+  * Procesos sospechosos (nombres extraños, rutas inusuales, ejecutables en `%TEMP%`, `%APPDATA%`, etc.).
+  * Servicios recién instalados o desconocidos.
+
+* `netstat.txt`, `arp.txt`, `ipconfig.txt`, `route.txt`
+  Información de red.
+  Búscalo para:
+
+  * Conexiones externas activas durante el incidente.
+  * IPs internas que puedan corresponder a máquinas de mando (p. ej. equipos del atacante).
+  * Cambios inusuales en tabla ARP o rutas.
+
+* `whoami_all.txt`, `query_user.txt`, `qwinsta.txt`
+  Información de seguridad de la cuenta y sesiones interactivas/RDP.
+  Útil para:
+
+  * Ver qué usuarios estaban logueados.
+  * Confirmar inicio de sesión interactivo o RDP previo al cifrado.
+
+* `schtasks.txt`
+  Todas las tareas programadas.
+  Revisa:
+
+  * Tareas con nombres ambiguos o recién creadas.
+  * Acciones que apunten a ejecutables en rutas de usuario o temporales.
+
+* `drivers.txt`
+  Listado de drivers cargados.
+  Útil para identificar drivers maliciosos o herramientas de EDR/AV presentes.
+
+Herramientas sugeridas para análisis:
+
+* Visualización manual (Notepad++, VS Code).
+* Para correlación automatizada, importar en tu SIEM o en scripts personalizados.
 
 ---
+
+### 5.2. Carpeta `logs\`
+
+#### a) `.evtx` individuales (wevtutil)
+
+Ficheros como:
+
+* `Security.evtx`
+* `System.evtx`
+* `Application.evtx`
+* `Microsoft-Windows-Sysmon_Operational.evtx`
+* `Microsoft-Windows-PowerShell_Operational.evtx`
+* `Microsoft-Windows-TaskScheduler_Operational.evtx`
+* `Microsoft-Windows-Windows Defender_Operational.evtx`
+* `Microsoft-Windows-WMI-Activity_Operational.evtx`
+* `Microsoft-Windows-Bits-Client_Operational.evtx`
+* `Microsoft-Windows-AppLocker_EXE and DLL.evtx`
+* Logs RDP:
+
+  * `Microsoft-Windows-TerminalServices-LocalSessionManager_Operational.evtx`
+  * `Microsoft-Windows-TerminalServices-RemoteConnectionManager_Operational.evtx`
+  * `Microsoft-Windows-RemoteDesktopServices-RdpCoreTS_Operational.evtx`
+
+Uso típico:
+
+* **Security**:
+
+  * Eventos de logon (4624/4625), cambios de permisos, uso de cuentas elevadas.
+* **Sysmon** (si está desplegado):
+
+  * Creación de procesos, conexiones IP, cambios en el registro.
+* **PowerShell**:
+
+  * Scripts y comandos utilizados por el atacante (por ejemplo, `Invoke-WebRequest`, `FromBase64String`, `-enc`).
+* **TaskScheduler**:
+
+  * Creación y ejecución de tareas maliciosas.
+* **Windows Defender**:
+
+  * Detecciones o bloqueos relacionados con el ransomware.
+* **WMI-Activity**:
+
+  * Uso de WMI para movimiento lateral o persistencia.
+* **BITS-Client**:
+
+  * Descarga de payloads usando BITS.
+* **AppLocker**:
+
+  * Bloqueos de ejecución (si AppLocker está configurado).
+* **RDP**:
+
+  * Sesiones RDP exitosas o fallidas (origen IP, hora).
+
+Herramientas típicas:
+
+* Visor de eventos (`eventvwr.msc`).
+* EVTX visualizers/analizadores (Chainsaw, Timesketch, etc.).
+
+#### b) Carpeta `logs\winevt\`
+
+Copia completa (o casi completa) de `C:\Windows\System32\winevt\Logs\*.evtx`.
+
+Uso:
+
+* Cuando necesitas una imagen más amplia de eventos (no solo los canales seleccionados).
+* Importable en herramientas de análisis más avanzadas.
+
+#### c) Firewall / IIS
+
+* `logs\Firewall\*`
+* `logs\IIS\*` (si existe IIS)
+
+Uso:
+
+* Identificar conexiones sospechosas, escaneos internos, tráfico inusual.
+* Revisar actividad HTTP previa al cifrado (posibles vectores de explotación).
+
+---
+
+### 5.3. Carpeta `artifacts\`
+
+Contenido principal:
+
+* `artifacts\Prefetch\*`
+  Permite ver ejecutables corridos recientemente (incluyendo el binario de ransomware).
+
+  * Analízalo con herramientas tipo WinPrefetchView, PECmd, etc.
+
+* `artifacts\Tasks\*`
+  Copia de las tareas programadas como ficheros XML/estructura interna.
+
+  * Útil para confirmar persistencias (ej. tareas que ejecutan `ransom.exe` al logon).
+
+* `artifacts\Startup_Global` y `artifacts\Startup_<Usuario>`
+  Archivos en las carpetas de inicio.
+
+  * Ver accesos directos que ejecutan binarios maliciosos.
+  * Ver scripts que se disparan al inicio de sesión.
+
+* `artifacts\WMI\*`
+  Ficheros de texto con:
+
+  * `EventFilter.txt`
+  * `EventConsumer.txt`
+  * `FilterToConsumerBinding.txt`
+
+  Uso:
+
+  * Buscar suscripciones WMI persistentes usadas por el atacante (técnicas de persistencia muy comunes).
+
+---
+
+### 5.4. Carpeta `registry\`
+
+#### Hives de sistema
+
+* `SAM.hiv`
+* `SYSTEM.hiv`
+* `SECURITY.hiv`
+* `SOFTWARE.hiv`
+* `DEFAULT.hiv`
+* `Amcache.hve` (si existe)
+
+Análisis:
+
+* Con herramientas forenses de registro (RegRipper, Registry Explorer, etc.).
+* Útil para:
+
+  * Ver servicios instalados.
+  * Revisar claves Run/RunOnce.
+  * Analizar historial de programas ejecutados (Amcache).
+  * Revisar cuentas de usuario, grupos, permisos.
+
+#### Hives de usuario
+
+Estructura:
+
+```text
+registry\Users\UsuarioX\
+  NTUSER.DAT
+  UsrClass.dat
+```
+
+Análisis:
+
+* Información de ejecución por usuario (MRUs, shellbags, etc.).
+* Rutas de arranque por usuario.
+* Claves de persistencia específicas de cada perfil.
+
+---
+
+### 5.5. Volcado de memoria (opcional)
+
+* Archivo `.raw` en la raíz de la carpeta, por ejemplo:
+
+  * `SRV-FILES-20251112T213358Z.raw`
+
+Análisis:
+
+* Cargar en herramientas de memoria (Volatility, Rekall, etc.).
+* Utilidad:
+
+  * Identificar procesos del ransomware (aunque ya no estén corriendo).
+  * Extraer cadenas, claves de cifrado, credenciales, etc.
+  * Ver conexiones de red y módulos cargados al momento del volcado.
+
+---
+
+### 5.6. `manifest.json`
+
+Ejemplo de campos:
+
+* `Host`, `TimeUTC`, `Operator`, `Base`
+* `MemoryDump`: nombre del fichero .raw (si se generó).
+* `System`:
+
+  * `OSVersion`, `Build`, `Caption`, `TotalRAMGB`, `FreeSpaceGB`
+* `Tooling`:
+
+  * `MemoryPath` (winpmem),
+  * `Script`, `ScriptVersion`,
+  * `WinpmemPresent` (bool).
+* `Notes`: texto aclarando que es triage de ransomware sin cadena de custodia estricta.
+
+Útil para:
+
+* Documentar en el reporte:
+
+  * Qué se ejecutó, cuándo y en qué host.
+  * Qué versión del script y de WinPMEM se usó.
+* Automatizar ingesta en plataformas de análisis (parsear JSON).
+
+---
+
+## 6. Buenas prácticas de uso en incidente de ransomware
+
+1. **Ejecutar lo antes posible**:
+
+   * Idealmente en cuanto se detecta el incidente, antes de apagar el equipo o que el atacante limpie evidencias.
+
+2. **Minimizar cambios en el sistema**:
+
+   * Evitar instalar software nuevo.
+   * Ejecutar el script desde un medio ya disponible (p. ej. unidad de red de DFIR, USB preparado).
+
+3. **Almacenar la evidencia en medio seguro**:
+
+   * `BasePath` apuntar a:
+
+     * disco USB dedicado,
+     * share DFIR de solo escritura para hosts comprometidos, etc.
+
+4. **Copiar el ZIP resultante a almacenamiento offline**:
+
+   * Una vez generado el `.zip`, copiarlo fuera del entorno afectado (repositorio interno seguro).
+
+5. **No eliminar la carpeta original hasta tener certeza**:
+
+   * Mientras se procesa el ZIP, conservar la carpeta raíz (`<Host>-<Time>`).
+   * El script **no borra nada** del sistema de origen.
+
+---
+
+## 7. Solución de problemas
+
+* **Mensaje: “Ejecuta este script en una PowerShell elevada”**
+
+  * Abrir PowerShell como administrador (clic derecho → “Run as administrator”).
+
+* **Canales de eventos inexistentes**
+
+  * Aparecerá como:
+
+    * `NOTE: Canal inexistente o deshabilitado: Microsoft-Windows-Sysmon/Operational`
+  * No es error crítico, solo indica que ese log no está habilitado.
+
+* **WinPMEM no encontrado**
+
+  * Si se usa `-DumpMemory` y el binario no está en la ruta:
+
+    * `WARN: WinPMEM no encontrado… RAM omitida.`
+  * Verificar `-WinpmemPath`.
+
+* **Espacio insuficiente**
+
+  * Para `-DumpMemory`, el script avisa si detecta poco espacio (≈120% de la RAM).
+  * Solución: cambiar `BasePath` a una unidad con más espacio.
+
+* **Errores registrados en `errors.log`**
+
+  * Revisar `errors.log` y `collection.log` para ver qué no se pudo copiar/exportar.
+  * Puede ser falta de permisos, canal de eventos deshabilitado, rutas inexistentes, etc.
+
+---
+
+## 8. Resumen
+
+El script `Collect-Evidence-Ransomware.ps1` está pensado como una herramienta de **recolección rápida y estructurada** de artefactos relevantes en incidentes de ransomware, priorizando:
+
+* Contexto del sistema.
+* Evidencia volátil.
+* Logs de eventos clave.
+* Artefactos de ejecución y persistencia.
+* Registro de sistema y usuarios.
+* WMI y tareas programadas.
+* Memoria (opcional).
+
+Sin hashing y sin cadena de custodia formal, orientado a investigación técnica interna, pruebas de laboratorio y mejora de capacidades de respuesta.
