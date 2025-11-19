@@ -1,5 +1,10 @@
 ﻿<#
-  Collect-Evidence-Ransomware.ps1  (v2.0.3)
+  Collect-Evidence-Ransomware.ps1  (v2.0.4)
+
+  Cambios vs 2.0.3:
+    - Mejora en gestión de WinPMEM (mensajes más claros y validaciones adicionales).
+    - Mejora en compresión ZIP (uso de .NET ZipFile/CreateFromDirectory con soporte ZIP64
+      y fallbacks; el fallo de creación de ZIP ya no se considera error crítico).
 
   Cambios vs 2.0.2:
     - Ajuste de la invocación a WinPMEM para la versión winpmem_mini_x64_rc2.exe
@@ -58,7 +63,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'Continue'
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-$ScriptVersion = '2.0.3'
+$ScriptVersion = '2.0.4'
 
 function Show-Help {
 @"
@@ -72,7 +77,7 @@ Descripción:
     - Artefactos comunes: winevt, Prefetch, Firewall/IIS, Tasks, Startup.
     - Hives de registro (HKLM y usuarios) y suscripciones WMI.
     - Volcado de memoria RAM (opcional, con WinPMEM).
-    - Compresión final a ZIP.
+    - Compresión final a ZIP (si es posible).
 
   No realiza hashing ni implementa cadena de custodia formal.
 
@@ -350,76 +355,65 @@ function Copy-FileWithFallback {
 }
 
 function New-Zip {
-  param(
-    [Parameter(Mandatory=$true)][string]$SourceRoot,
-    [Parameter(Mandatory=$true)][string]$ZipPath
-  )
+    param(
+        [Parameter(Mandatory=$true)][string]$SourceRoot,
+        [Parameter(Mandatory=$true)][string]$ZipPath
+    )
 
-  Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
 
-  $haveDotNetZip = $false
-  try {
-    $null = [Type]::GetType('System.IO.Compression.ZipArchiveMode, System.IO.Compression', $false)
-    if (-not $?) {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
-    }
-    $zipModeType = [Type]::GetType('System.IO.Compression.ZipArchiveMode, System.IO.Compression', $false)
-    $levelType   = [Type]::GetType('System.IO.Compression.CompressionLevel, System.IO.Compression', $false)
-
-    if ($zipModeType -and $levelType) { $haveDotNetZip = $true }
-  } catch {
-    $haveDotNetZip = $false
-  }
-
-  if ($haveDotNetZip) {
-    $fs  = $null
-    $zip = $null
+    # 1) Intento principal: .NET ZipFile.CreateFromDirectory (ZIP64)
     try {
-      $files = Get-ChildItem -LiteralPath $SourceRoot -Recurse -File -Force -ErrorAction SilentlyContinue
-      $cnt   = [math]::Max(1, $files.Count)
-      $j     = 0
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
 
-      $fs  = [System.IO.File]::Open($ZipPath,[System.IO.FileMode]::Create,[System.IO.FileAccess]::ReadWrite,[System.IO.FileShare]::None)
-      $zip = New-Object System.IO.Compression.ZipArchive($fs,[System.IO.Compression.ZipArchiveMode]::Create,$false)
+        [System.IO.Compression.ZipFile]::CreateFromDirectory(
+            $SourceRoot,
+            $ZipPath,
+            [System.IO.Compression.CompressionLevel]::Optimal,
+            $false
+        )
 
-      foreach ($f in $files) {
-        $j++
-        Write-Progress -Id 5 -ParentId 1 -Activity 'Compresión ZIP' -Status $f.FullName -PercentComplete ([int](($j/$cnt)*100))
-        $rel = $f.FullName.Substring($SourceRoot.Length).TrimStart('\','/')
-        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-            $zip,
-            $f.FullName,
-            $rel,
-            [System.IO.Compression.CompressionLevel]::Optimal
-        ) | Out-Null
-      }
-      return
-    } finally {
-      if ($zip) { $zip.Dispose() }
-      if ($fs)  { $fs.Dispose() }
-    }
-  }
-
-  try {
-    Compress-Archive -Path (Join-Path $SourceRoot '*') -DestinationPath $ZipPath -Force -ErrorAction Stop
-    return
-  } catch {
-    Warn "Compress-Archive falló: $($_.Exception.Message)"
-  }
-
-  try {
-    & tar.exe -a -c -f $ZipPath -C $SourceRoot .
-    if ($LASTEXITCODE -eq 0) {
-        Log 'tar.exe ZIP OK'
+        Log "ZIP (.NET CreateFromDirectory) OK: $ZipPath"
         return
-    } else {
-        Warn "tar.exe ZIP falló. Code=$LASTEXITCODE"
+    } catch {
+        Note "ZIP (.NET CreateFromDirectory) falló: $($_.Exception.Message). Se intentan otros métodos."
     }
-  } catch {
-    Warn "tar.exe ZIP excepción: $($_.Exception.Message)"
-  }
 
-  Warn 'No se pudo crear ZIP con ningún método disponible.'
+    # 2) Fallback: Compress-Archive, solo si existe el cmdlet
+    if (Get-Command -Name Compress-Archive -ErrorAction SilentlyContinue) {
+        try {
+            Compress-Archive -Path (Join-Path $SourceRoot '*') `
+                             -DestinationPath $ZipPath `
+                             -Force -ErrorAction Stop
+            Log "ZIP (Compress-Archive) OK: $ZipPath"
+            return
+        } catch {
+            Note "Compress-Archive falló (no crítico): $($_.Exception.Message)"
+        }
+    } else {
+        Note "Compress-Archive no está disponible en esta versión de PowerShell."
+    }
+
+    # 3) Fallback adicional: tar.exe, solo si está disponible
+    $tarCmd = Get-Command -Name tar.exe -ErrorAction SilentlyContinue
+    if ($tarCmd) {
+        try {
+            & $tarCmd.Source -a -c -f $ZipPath -C $SourceRoot .
+            if ($LASTEXITCODE -eq 0) {
+                Log "ZIP (tar.exe) OK: $ZipPath"
+                return
+            } else {
+                Note "tar.exe ZIP falló (no crítico). Code=$LASTEXITCODE"
+            }
+        } catch {
+            Note "tar.exe ZIP excepción (no crítico): $($_.Exception.Message)"
+        }
+    } else {
+        Note "tar.exe no está disponible en este sistema, se omite fallback."
+    }
+
+    # 4) Si llega aquí, no se pudo crear ZIP automáticamente
+    Note "No se pudo crear ZIP automáticamente. La carpeta $SourceRoot contiene toda la evidencia; comprímela manualmente si es necesario."
 }
 
 # --- Prechequeo ---
@@ -434,7 +428,7 @@ if (-not $IsAdmin) {
 try {
     Start-Transcript -Path (Join-Path $root 'transcript.log') -Force | Out-Null
 } catch {
-    Warn "No se pudo iniciar Transcript: $($_.Exception.Message)"
+    Note "No se pudo iniciar Transcript: $($_.Exception.Message)"
 }
 
 # --- Plan de pasos ---
@@ -664,7 +658,6 @@ if ($DumpMemory) {
     $Step++; StepProgress $Step $TotalSteps 'Memoria'
     Log 'Volcado de RAM con WinPMEM'
 
-    # Validar WinpmemPath no vacío antes de Test-Path
     if (-not $WinpmemPath -or $WinpmemPath.Trim().Length -eq 0) {
         Warn "Se especificó -DumpMemory pero -WinpmemPath está vacío. RAM omitida."
     } elseif (-not (Test-Path -LiteralPath $WinpmemPath)) {
@@ -677,29 +670,44 @@ if ($DumpMemory) {
                 $driveLetter = $BasePath.Substring(0,2)
                 $drv = New-Object System.IO.DriveInfo($driveLetter.TrimEnd('\'))
                 if ($drv.AvailableFreeSpace -lt $totalRam * 1.2) {
-                    Warn "Espacio libre insuficiente en $driveLetter para volcado de memoria. Se requiere al menos ~120% de la RAM (~$([math]::Round($totalRam/1GB,2)) GB)."
+                    Warn ("Espacio libre insuficiente en {0} para volcado de memoria. " +
+                          "Se requiere al menos ~120% de la RAM (~{1} GB)." -f $driveLetter,
+                          [math]::Round($totalRam/1GB,2))
                 }
             }
 
-            # Para winpmem_mini_x64_rc2.exe la sintaxis es:
-            #   winpmem_mini_x64_rc2.exe <ruta_salida.raw>
-            # (en sistemas AMD64 la opción -2 es el valor por defecto).
             $memPath   = Join-Path $root "$hostn-$ts.raw"
             $arguments = @($memPath)
 
-            $proc = Start-Process -FilePath $WinpmemPath -ArgumentList $arguments -NoNewWindow -PassThru
+            $proc = Start-Process -FilePath $WinpmemPath `
+                                  -ArgumentList $arguments `
+                                  -NoNewWindow -PassThru
 
-            while (-not $proc.HasExited) {
-                $size = if (Test-Path -LiteralPath $memPath) { (Get-Item -LiteralPath $memPath).Length } else { 0 }
-                $pct  = if ($totalRam -gt 0) { [int]([math]::Min(99, ($size / $totalRam) * 100)) } else { 0 }
-                Write-Progress -Id 3 -ParentId 1 -Activity 'WinPMEM' -Status ("{0:N2} MB escritos" -f ($size/1MB)) -PercentComplete $pct
+            while ($proc -and -not $proc.HasExited) {
+                $size = if (Test-Path -LiteralPath $memPath) {
+                    (Get-Item -LiteralPath $memPath).Length
+                } else { 0 }
+                $pct  = if ($totalRam -gt 0) {
+                    [int]([math]::Min(99, ($size / $totalRam) * 100))
+                } else { 0 }
+                Write-Progress -Id 3 -ParentId 1 -Activity 'WinPMEM' `
+                    -Status ("{0:N2} MB escritos" -f ($size/1MB)) `
+                    -PercentComplete $pct
                 Start-Sleep -Seconds 2
             }
 
             Write-Progress -Id 3 -ParentId 1 -Activity 'WinPMEM' -Completed
 
-            if ($proc.ExitCode -ne 0) {
-                Warn "WinPMEM ExitCode=$($proc.ExitCode)"
+            if (-not $proc) {
+                Warn ("WinPMEM no se inició correctamente. No hay objeto de proceso disponible. " +
+                      "Verifica la ruta y prueba a ejecutar la herramienta manualmente.")
+            } elseif ($proc.ExitCode -ne 0) {
+                Warn ("WinPMEM terminó con error. ExitCode={0}. " +
+                      "Ejecuta WinPMEM manualmente para ver el mensaje detallado en consola." -f $proc.ExitCode)
+            } elseif (-not (Test-Path -LiteralPath $memPath)) {
+                Warn "WinPMEM terminó con ExitCode=0 pero no se encontró el archivo de volcado en $memPath."
+            } else {
+                Log "WinPMEM OK. Dump en: $memPath"
             }
         } catch {
             Warn "WinPMEM: $($_.Exception.Message)"
@@ -768,7 +776,7 @@ try {
 try {
     Stop-Transcript | Out-Null
 } catch {
-    Warn "Stop-Transcript: $($_.Exception.Message)"
+    Note "Stop-Transcript: $($_.Exception.Message)"
 }
 
 # 10) ZIP
