@@ -171,7 +171,7 @@ function Try-Copy {
         Copy-Item -LiteralPath $Source -Destination $Dest -Force -ErrorAction Stop
         Log "Copiado: $Source"
     } catch {
-        Warn "No se pudo copiar $Source: $($_.Exception.Message)"
+        Warn "No se pudo copiar $Source $($_.Exception.Message)"
     }
 }
 
