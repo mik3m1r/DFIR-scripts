@@ -118,7 +118,7 @@ $null = New-Item -ItemType Directory -Path $root -Force
 
 $LogPath    = Join-Path $root 'collection.log'
 $ErrorsPath = Join-Path $root 'errors.log'
-$global:ErrorList = New-Object System.Collections.ArrayList
+$global:ErrorList = @()   # Corregido: usar array en lugar de ArrayList
 
 function Log {
     param([string]$msg)
@@ -130,7 +130,8 @@ function Warn {
     param([string]$msg)
     $t = (Get-Date).ToUniversalTime().ToString('o')
     "[{0}] [WARN] {1}" -f $t, $msg | Tee-Object -FilePath $LogPath -Append | Out-Host
-    [void]$global:ErrorList.Add($msg)
+    # Corregido: agregar al array en lugar de usar .Add() sobre ArrayList
+    $global:ErrorList += $msg
 }
 
 function Note {
@@ -165,25 +166,15 @@ function Invoke-ExternalRaw {
         [string[]]$ArgumentList = @()
     )
 
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName               = $FilePath
-    $psi.Arguments              = ($ArgumentList | ForEach-Object { Quote-Arg $_ }) -join ' '
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
-    $psi.UseShellExecute        = $false
-    $psi.CreateNoWindow         = $true
-
-    $p = New-Object System.Diagnostics.Process
-    $p.StartInfo = $psi
-    [void]$p.Start()
-    $out = $p.StandardOutput.ReadToEnd()
-    $err = $p.StandardError.ReadToEnd()
-    $p.WaitForExit()
+    # Implementación simple usando &, capturando salida combinada
+    $out = & $FilePath @ArgumentList 2>&1
+    $code = $LASTEXITCODE
+    $global:LASTEXITCODE = 0
 
     return @{
-        ExitCode = $p.ExitCode
-        StdOut   = $out
-        StdErr   = $err
+        ExitCode = $code
+        StdOut   = ($out | Out-String)
+        StdErr   = ''
     }
 }
 
@@ -668,8 +659,8 @@ if ($DumpMemory) {
 
             if ($BasePath -match '^[A-Za-z]:') {
                 $driveLetter = $BasePath.Substring(0,2)
-                $drv = New-Object System.IO.DriveInfo($driveLetter.TrimEnd('\'))
-                if ($drv.AvailableFreeSpace -lt $totalRam * 1.2) {
+                $drv = Get-PSDrive -Name ($driveLetter.TrimEnd('\').TrimEnd(':')) -ErrorAction SilentlyContinue
+                if ($drv -and $drv.Free -lt $totalRam * 1.2) {
                     Warn ("Espacio libre insuficiente en {0} para volcado de memoria. " +
                           "Se requiere al menos ~120% de la RAM (~{1} GB)." -f $driveLetter,
                           [math]::Round($totalRam/1GB,2))
@@ -727,8 +718,11 @@ try {
     $freeGB = $null
 
     if ($BasePath -match '^[A-Za-z]:') {
-        $drv    = New-Object System.IO.DriveInfo($BasePath.Substring(0,2).TrimEnd('\'))
-        $freeGB = [math]::Round(($drv.AvailableFreeSpace / 1GB),2)
+        $driveName = $BasePath.Substring(0,2).TrimEnd('\').TrimEnd(':')
+        $drv    = Get-PSDrive -Name $driveName -ErrorAction SilentlyContinue
+        if ($drv) {
+            $freeGB = [math]::Round(($drv.Free / 1GB),2)
+        }
     }
 
     $toolMemLeaf = if ($WinpmemPath) { Split-Path -Leaf $WinpmemPath } else { '' }
@@ -799,18 +793,28 @@ if ($FinalizeACL) {
     $Step++; StepProgress $Step $TotalSteps 'ACL final (opcional)'
     try {
         Log 'Aplicando ACL de solo lectura (opcional)'
-        $adminSid  = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'
-        $adminAcct = $adminSid.Translate([System.Security.Principal.NTAccount]).Value
 
-        cmd /c "icacls `"$root`"   /inheritance:r"                1>nul 2>nul
-        cmd /c "icacls `"$root`"   /grant:r `"$adminAcct`":(R) /T" 1>nul 2>nul
-        cmd /c "icacls `"$zipPath`" /inheritance:r"               1>nul 2>nul
-        cmd /c "icacls `"$zipPath`" /grant:r `"$adminAcct`":(R)"  1>nul 2>nul
-
+        # En entornos con ConstrainedLanguage puede fallar la creación de objetos .NET.
+        # Si falla, simplemente se omite el endurecimiento de ACL.
+        $adminAcct = $null
         try {
-            attrib +R $zipPath
+            $adminSid  = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+            $adminAcct = $adminSid.Translate([System.Security.Principal.NTAccount]).Value
         } catch {
-            Warn "attrib ZIP: $($_.Exception.Message)"
+            Note "No se pudo resolver SID de Administradores, se omite endurecimiento ACL: $($_.Exception.Message)"
+        }
+
+        if ($adminAcct) {
+            cmd /c "icacls `"$root`"   /inheritance:r"                  1>nul 2>nul
+            cmd /c "icacls `"$root`"   /grant:r `"$adminAcct`":(R) /T"  1>nul 2>nul
+            cmd /c "icacls `"$zipPath`" /inheritance:r"                 1>nul 2>nul
+            cmd /c "icacls `"$zipPath`" /grant:r `"$adminAcct`":(R)"    1>nul 2>nul
+
+            try {
+                attrib +R $zipPath
+            } catch {
+                Warn "attrib ZIP: $($_.Exception.Message)"
+            }
         }
     } catch {
         Warn "ACL final: $($_.Exception.Message)"
